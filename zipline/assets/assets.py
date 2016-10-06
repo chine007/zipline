@@ -13,9 +13,12 @@
 # limitations under the License.
 
 from abc import ABCMeta
+import array
+import binascii
 from collections import namedtuple
 from numbers import Integral
 from operator import itemgetter, attrgetter
+import struct
 
 from logbook import Logger
 import numpy as np
@@ -46,6 +49,7 @@ from zipline.errors import (
 from . import (
     Asset, Equity, Future,
 )
+from . continuous_futures import OrderedContracts, ContinuousFuture
 from .asset_writer import (
     check_version_info,
     split_delimited_symbol,
@@ -161,6 +165,8 @@ class AssetFinder(object):
         # The caches are read through, i.e. accessing an asset through
         # retrieve_asset will populate the cache on first retrieval.
         self._caches = (self._asset_cache, self._asset_type_cache) = {}, {}
+
+        self._ordered_contracts = {}
 
         # Populated on first call to `lifetimes`.
         self._asset_lifetimes = None
@@ -820,6 +826,78 @@ class AssetFinder(object):
         ))
 
         return sids
+
+    def _get_contract_info(self, root_symbol):
+        fc_cols = self.futures_contracts.c
+
+        fields = (fc_cols.sid, fc_cols.start_date, fc_cols.auto_close_date)
+
+        return list(sa.select(fields).where(
+                (fc_cols.root_symbol == root_symbol) &
+                (fc_cols.start_date != pd.NaT.value))
+            .order_by(fc_cols.auto_close_date).execute().fetchall())
+
+    def _get_root_symbol_exchange(self, root_symbol):
+        fc_cols = self.futures_root_symbols.c
+
+        fields = (fc_cols.exchange,)
+
+        return sa.select(fields).where(
+            fc_cols.root_symbol == root_symbol).execute().fetchone()[0]
+
+    def get_ordered_contracts(self, root_symbol):
+        try:
+            return self._ordered_contracts[root_symbol]
+        except KeyError:
+            contract_info = self._get_contract_info(root_symbol)
+            size = len(contract_info)
+            sids = np.full(size, 0, dtype=np.int64)
+            start_dates = np.full(size, 0, dtype=np.int64)
+            auto_close_dates = np.full(size, 0, dtype=np.int64)
+            self._size = size
+            for i, info in enumerate(contract_info):
+                sid, start_date, auto_close_date = info
+                sids[i] = sid
+                start_dates[i] = start_date
+                auto_close_dates[i] = auto_close_date
+            oc = OrderedContracts(root_symbol,
+                                  sids,
+                                  start_dates,
+                                  auto_close_dates)
+            self._ordered_contracts[root_symbol] = oc
+            return oc
+
+    def create_continuous_future(self, root_symbol, offset, roll_style):
+        oc = self.get_ordered_contracts(root_symbol)
+        start_date = self.retrieve_asset(oc.contract_sids[0]).start_date
+        end_date = self.retrieve_asset(oc.contract_sids[-1]).end_date
+        exchange = self._get_root_symbol_exchange(root_symbol)
+
+        # TODO: Should this be separate method?
+        # Also, review slot 'schema'.
+        s = struct.Struct("B 3B 2s B B")
+        # B - sid type
+        # 3B - empty space
+        # 2s - root symbol
+        # B - offset
+        # B - roll type
+        a = array.array('c', '\0' * s.size)
+        values = (1,  # sid type # TODO: Define constant.
+                  0, 0, 0,
+                  root_symbol,
+                  offset,
+                  0)  # TODO: Define roll style ids.
+        s.pack_into(a, 0, *values)
+        sid = int(binascii.hexlify(a), 16)
+        cf = ContinuousFuture(sid,
+                              root_symbol,
+                              offset,
+                              roll_style,
+                              start_date,
+                              end_date,
+                              exchange)
+        self._asset_cache[cf] = cf
+        return cf
 
     def _make_sids(tblattr):
         def _(self):
